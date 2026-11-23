@@ -8,6 +8,7 @@ package com.aws.greengrass.deployment;
 import com.aws.greengrass.config.WhatHappened;
 import com.aws.greengrass.dependency.InjectionActions;
 import com.aws.greengrass.deployment.exceptions.DeviceConfigurationException;
+import com.aws.greengrass.deployment.exceptions.JobStatusUpdateRejectedException;
 import com.aws.greengrass.deployment.model.Deployment;
 import com.aws.greengrass.deployment.model.Deployment.DeploymentType;
 import com.aws.greengrass.deployment.model.DeploymentTaskMetadata;
@@ -406,11 +407,18 @@ public class IotJobsHelper implements InjectionActions {
                         .log(UPDATE_DEPLOYMENT_STATUS_MQTT_ERROR_LOG);
                 return false;
             }
-            // This happens when job status update gets rejected from the Iot Cloud
-            // Want to remove this job from the list and continue updating others
+            if (e.getCause() instanceof JobStatusUpdateRejectedException) {
+                // The IoT Jobs service rejected this specific update, so retrying it is pointless. Drop the record
+                // and let the remaining updates proceed.
+                logger.atError().kv(STATUS_LOG_KEY_NAME, status).kv(JOB_ID_LOG_KEY_NAME, jobId).setCause(e)
+                        .log("Job status update rejected");
+                return true;
+            }
+            // Anything else - authorization, throttling, an unexpected failure - may succeed later, so keep the
+            // record and stop this round to preserve the order.
             logger.atError().kv(STATUS_LOG_KEY_NAME, status).kv(JOB_ID_LOG_KEY_NAME, jobId).setCause(e)
-                    .log("Job status update rejected");
-            return true;
+                    .log("Job status update failed, will retry");
+            return false;
         } catch (TimeoutException e) {
             // assuming this is due to network issue
             logger.info(UPDATE_DEPLOYMENT_STATUS_TIMEOUT_ERROR_LOG);
@@ -450,7 +458,9 @@ public class IotJobsHelper implements InjectionActions {
                 (response) -> {
                     logger.atWarn().kv(JOB_ID_LOG_KEY_NAME, jobId).kv(STATUS_LOG_KEY_NAME, status)
                             .log("Job status updated rejected");
-                    gotResponse.completeExceptionally(new Exception(response.message));
+                    // Only an explicit rejection from the service means the update can never succeed. Everything
+                    // else (connectivity, credentials, throttling) is retried by the caller.
+                    gotResponse.completeExceptionally(new JobStatusUpdateRejectedException(response.message));
                 });
 
         // Truncate status detail map values longer than the 1024 characters limit

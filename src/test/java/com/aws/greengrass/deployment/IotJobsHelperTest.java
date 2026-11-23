@@ -51,6 +51,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+
+import static java.util.concurrent.CompletableFuture.failedFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -864,6 +866,73 @@ class IotJobsHelperTest {
         // IN_PROGRESS should be dropped — no standalone connection, no clear
         verify(mockEndpointSwitchState, never()).getSourceIotDataEndpoint();
         verify(mockEndpointSwitchState, never()).clear();
+    }
+
+    @Test
+    void GIVEN_cloud_rejects_update_WHEN_status_changed_THEN_returns_true_to_drop_the_record(
+            ExtensionContext extContext) throws Exception {
+        ignoreExceptionOfType(extContext, ExecutionException.class);
+        iotJobsHelper.postInject();
+        EndpointSwitchState mockEndpointSwitchState = mock(EndpointSwitchState.class);
+        when(mockContext.get(EndpointSwitchState.class)).thenReturn(mockEndpointSwitchState);
+        when(mockEndpointSwitchState.isEndpointSwitchDeployment("test-job-id")).thenReturn(false);
+
+        when(mockIotJobsClientWrapper.SubscribeToUpdateJobExecutionAccepted(any(), any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(0));
+        when(mockIotJobsClientWrapper.SubscribeToUpdateJobExecutionRejected(any(), any(), any()))
+                .thenAnswer(invocation -> {
+                    Consumer<RejectedError> rejected = invocation.getArgument(2);
+                    RejectedError rejectedError = new RejectedError();
+                    rejectedError.message = REJECTION_MESSAGE;
+                    rejected.accept(rejectedError);
+                    return CompletableFuture.completedFuture(0);
+                });
+        when(mockIotJobsClientWrapper.PublishUpdateJobExecution(any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(0));
+
+        ArgumentCaptor<java.util.function.Function> consumerCaptor =
+                ArgumentCaptor.forClass(java.util.function.Function.class);
+        verify(deploymentStatusKeeper).registerDeploymentStatusConsumer(
+                eq(IOT_JOBS), consumerCaptor.capture(), any());
+
+        Map<String, Object> details = new HashMap<>();
+        details.put("DeploymentId", "test-job-id");
+        details.put("DeploymentStatus", "SUCCEEDED");
+        details.put("DeploymentStatusDetails", new HashMap<>());
+
+        // An explicit rejection means the update can never succeed, so the record is dropped (returns true).
+        assertTrue((Boolean) consumerCaptor.getValue().apply(details));
+    }
+
+    @Test
+    void GIVEN_authorization_failure_WHEN_status_changed_THEN_returns_false_to_retry_later(
+            ExtensionContext extContext) throws Exception {
+        ignoreExceptionOfType(extContext, ExecutionException.class);
+        iotJobsHelper.postInject();
+        EndpointSwitchState mockEndpointSwitchState = mock(EndpointSwitchState.class);
+        when(mockContext.get(EndpointSwitchState.class)).thenReturn(mockEndpointSwitchState);
+        when(mockEndpointSwitchState.isEndpointSwitchDeployment("test-job-id")).thenReturn(false);
+
+        when(mockIotJobsClientWrapper.SubscribeToUpdateJobExecutionAccepted(any(), any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(0));
+        when(mockIotJobsClientWrapper.SubscribeToUpdateJobExecutionRejected(any(), any(), any()))
+                .thenReturn(CompletableFuture.completedFuture(0));
+        // A non-MQTT failure that is not an explicit rejection (for example an authorization error).
+        when(mockIotJobsClientWrapper.PublishUpdateJobExecution(any(), any()))
+                .thenReturn(failedFuture(new IllegalStateException("access denied")));
+
+        ArgumentCaptor<java.util.function.Function> consumerCaptor =
+                ArgumentCaptor.forClass(java.util.function.Function.class);
+        verify(deploymentStatusKeeper).registerDeploymentStatusConsumer(
+                eq(IOT_JOBS), consumerCaptor.capture(), any());
+
+        Map<String, Object> details = new HashMap<>();
+        details.put("DeploymentId", "test-job-id");
+        details.put("DeploymentStatus", "SUCCEEDED");
+        details.put("DeploymentStatusDetails", new HashMap<>());
+
+        // Unknown failures are treated as retryable so the record is kept for the next round (returns false).
+        assertFalse((Boolean) consumerCaptor.getValue().apply(details));
     }
 
     private JobExecutionData getMockJobExecutionData(String jobId, Timestamp ts) {
